@@ -43,7 +43,6 @@ impl Clip {
     ) -> Result<Self, rand::distr::uniform::Error> {
         let mut rng = rand::rng();
         let section_size_range = Uniform::new(section_size_range_low, section_size_range_high)?;
-        let frame_rate_range = Uniform::new(0u8, 10u8)?;
         let pattern_range = Uniform::new_inclusive(0u8, 4u8)?;
 
         let len_per_section: Vec<_> = section_size_range
@@ -57,13 +56,8 @@ impl Clip {
             }))
             .take(n_sections)
             .collect();
-        let frame_rate_per_section: Vec<_> = frame_rate_range
-            .sample_iter(&mut rng)
-            .map(|v| match v {
-                0..10 => FrameRate::Fps24p,
-                100 => FrameRate::Fps30p,
-                _ => FrameRate::Fps60i,
-            })
+        let frame_rate_per_section: Vec<_> = (0..n_sections)
+            .map(|_| FrameRate::Fps24p)
             .take(n_sections)
             .collect();
         let sections: Vec<_> = start_per_section

@@ -4,15 +4,6 @@ use itertools::{Itertools, izip};
 use rand::distr::{Distribution, Uniform};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum FieldMatch {
-    Previous,
-    Current,
-    Next,
-    PreviousOpposite,
-    NextOpposite,
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Decimation {
     Keep,
     Decimate,
@@ -32,16 +23,16 @@ enum Modification {
     RemoveDecimation,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct Section {
     start_frame: usize,
     frame_rate: FrameRate,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Clip {
     sections: Vec<Section>,
-    pattern: Vec<(FieldMatch, Decimation)>,
+    pattern: Vec<Decimation>,
 }
 
 impl Clip {
@@ -92,32 +83,26 @@ impl Clip {
         .flat_map(|(len, frame_rate, pattern)| match frame_rate {
             FrameRate::Fps24p => (0..*len)
                 .map(|i| match (i + pattern as usize) % 5 {
-                    0..=2 => (FieldMatch::Current, Decimation::Keep),
-                    3 => (
-                        if i < len - 1 {
-                            FieldMatch::Next
-                        } else {
-                            FieldMatch::PreviousOpposite
-                        },
-                        Decimation::Keep,
-                    ),
-                    _ => (
-                        if i < len - 1 {
-                            FieldMatch::Next
-                        } else {
-                            FieldMatch::PreviousOpposite
-                        },
-                        Decimation::Decimate,
-                    ),
+                    0..=3 => Decimation::Keep,
+                    _ => Decimation::Decimate,
                 })
                 .collect::<Vec<_>>(),
-            _ => (0..*len)
-                .map(|_| (FieldMatch::Current, Decimation::Keep))
-                .collect::<Vec<_>>(),
+            _ => (0..*len).map(|_| Decimation::Keep).collect::<Vec<_>>(),
         })
         .collect();
 
         Ok(Self { sections, pattern })
+    }
+
+    fn patterns_per_section(&self) -> impl Iterator<Item = &[Decimation]> {
+        self.sections
+            .windows(2)
+            .map(|s| &self.pattern[s[0].start_frame..s[1].start_frame])
+            .chain(self.sections.last().map(|s| &self.pattern[s.start_frame..]))
+    }
+
+    fn len_per_section(&self) -> impl Iterator<Item = usize> {
+        self.patterns_per_section().map(|p| p.len())
     }
 }
 
@@ -157,43 +142,38 @@ fn calc_error(
 }
 
 fn optimize_decimations(clip: &Clip) -> Vec<Modification> {
-    let patterns_per_section: Vec<_> = clip
-        .sections
-        .windows(2)
-        .map(|s| &clip.pattern[s[0].start_frame..s[1].start_frame])
-        .chain(clip.sections.last().map(|s| &clip.pattern[s.start_frame..]))
-        .collect();
-
-    let len_per_section: Vec<_> = patterns_per_section.iter().map(|p| p.len()).collect();
-    let n_decimations_per_section: Vec<_> = patterns_per_section
-        .iter()
-        .map(|p| p.iter().filter(|(_, d)| *d == Decimation::Decimate).count())
-        .collect();
+    let patterns_per_section: Vec<_> = clip.patterns_per_section().collect();
+    let len_per_section: Vec<_> = clip.len_per_section().collect();
     let frame_rate_per_section: Vec<_> = clip
         .sections
         .iter()
         .map(|Section { frame_rate, .. }| *frame_rate)
         .collect();
 
+    let n_decimations_per_section: Vec<_> = patterns_per_section
+        .iter()
+        .map(|p| p.iter().filter(|d| **d == Decimation::Decimate).count())
+        .collect();
+
+    let diff_per_section: Vec<_> = izip!(
+        &len_per_section,
+        &n_decimations_per_section,
+        &frame_rate_per_section,
+    )
+    .map(|(len, n_decimations, frame_rate)| match frame_rate {
+        FrameRate::Fps24p => *len as isize - (n_decimations * 5) as isize,
+        _ => 0,
+    })
+    .collect();
+
     let mut best_modifications: Vec<_> =
         clip.sections.iter().map(|_| Modification::Leave).collect();
     let mut best_n_decimations_per_section = n_decimations_per_section.clone();
     let mut best_error = isize::MAX;
+
     for modifications in
         std::iter::repeat_n([false, true], clip.sections.len()).multi_cartesian_product()
     {
-        let diff_per_section: Vec<_> = izip!(
-            &len_per_section,
-            &n_decimations_per_section,
-            &frame_rate_per_section
-        )
-        .map(|(len, n_decimations, frame_rate)| match frame_rate {
-            FrameRate::Fps24p => *len as isize - (n_decimations * 5) as isize,
-            FrameRate::Fps30p => 0,
-            FrameRate::Fps60i => 0,
-        })
-        .collect();
-
         let modifications: Vec<_> = modifications
             .iter()
             .zip(&diff_per_section)
@@ -209,6 +189,7 @@ fn optimize_decimations(clip: &Clip) -> Vec<Modification> {
                 }
             })
             .collect();
+
         let n_decimations_per_section: Vec<_> = n_decimations_per_section
             .iter()
             .zip(&modifications)
@@ -232,26 +213,26 @@ fn optimize_decimations(clip: &Clip) -> Vec<Modification> {
     }
 
     println!("frames in original: {}", clip.pattern.len());
+    let n_frames_default_decimation =
+        clip.pattern.len() - n_decimations_per_section.iter().sum::<usize>();
     println!(
         "frames in default decimation: {} - error: {}%",
-        clip.pattern.len() - n_decimations_per_section.iter().sum::<usize>(),
-        ((clip.pattern.len() - n_decimations_per_section.iter().sum::<usize>()) as f32
-            / (clip.pattern.len() as f32 / 5. * 4.)
-            - 1.)
-            * 100.
+        n_frames_default_decimation,
+        ((n_frames_default_decimation) as f32 / (clip.pattern.len() as f32 / 5. * 4.) - 1.) * 100.
     );
+    let n_frames_optimized_decimation =
+        clip.pattern.len() - best_n_decimations_per_section.iter().sum::<usize>();
     println!(
         "frames in optimised decimation: {} - error: {}%",
         clip.pattern.len() - best_n_decimations_per_section.iter().sum::<usize>(),
-        ((clip.pattern.len() - best_n_decimations_per_section.iter().sum::<usize>()) as f32
-            / (clip.pattern.len() as f32 / 5. * 4.)
-            - 1.)
+        ((n_frames_optimized_decimation) as f32 / (clip.pattern.len() as f32 / 5. * 4.) - 1.)
             * 100.
     );
+    let n_frames_wobbly_decimation = clip.pattern.len() / 5 * 4;
     println!(
         "frames in wobbly decimation: {} - error: {}%",
-        clip.pattern.len() / 5 * 4,
-        ((clip.pattern.len() / 5 * 4) as f32 / (clip.pattern.len() as f32 / 5. * 4.) - 1.) * 100.
+        n_frames_wobbly_decimation,
+        ((n_frames_wobbly_decimation) as f32 / (clip.pattern.len() as f32 / 5. * 4.) - 1.) * 100.
     );
 
     best_modifications
